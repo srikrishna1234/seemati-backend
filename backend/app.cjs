@@ -3,6 +3,7 @@
 // - reads CORS_ALLOWED_ORIGINS, ALLOWED_ORIGINS, FRONTEND_ORIGIN
 // - canonicalizes origins (URL origin or trimmed lower-case w/out trailing slash)
 // - prints debug logs and byte-dumps on mismatch
+// - attempts to mount a wide set of public product routers (productRoutes, publicProducts, public-products, etc.)
 // - echoes CORS headers into error responses while debugging (remove later)
 // - mounts your existing routes (best-effort) and provides /__debug/env
 'use strict';
@@ -123,6 +124,13 @@ async function tryRequire(p) {
   }
 }
 
+// Helper: tolerant loader for multiple candidate router filenames
+function candidatePaths(base) {
+  // base examples: "./src/routes/publicProducts"
+  const exts = ['', '.cjs', '.js', '.mjs'];
+  return exts.map((e) => `${base}${e}`);
+}
+
 // --- main server bootstrap ---
 (async function main() {
   console.log('Starting backend (CommonJS app.cjs)');
@@ -203,6 +211,7 @@ async function tryRequire(p) {
     { path: './src/routes/presign-get.cjs', mount: '/api/presign-get' },
     { path: './src/routes/presign.cjs', mount: '/api/presign' },
     { path: './src/routes/admin-presign.cjs', mount: '/admin-api' },
+    // upload router often contains /products or product upload endpoints
     { path: './src/routes/upload.cjs', mount: '/api' },
     { path: './src/routes/upload.js', mount: '/api' },
   ];
@@ -217,6 +226,54 @@ async function tryRequire(p) {
     } catch (e) {
       console.warn(`Failed to mount ${r.path}:`, e && e.message ? e.message : e);
     }
+  }
+
+  // --- NEW: attempt to find & mount public/product routes automatically ---
+  const publicCandidates = [
+    './src/routes/publicProducts',
+    './src/routes/publicProducts.cjs',
+    './src/routes/publicProducts.js',
+    './src/routes/public-products',
+    './src/routes/public-products.cjs',
+    './src/routes/public-products.js',
+    './src/routes/productRoutes',
+    './src/routes/productRoutes.cjs',
+    './src/routes/productRoutes.js',
+    './src/routes/products',
+    './src/routes/products.cjs',
+    './src/routes/products.js'
+  ];
+
+  let mountedPublic = false;
+  for (const cand of publicCandidates) {
+    try {
+      const mod = await tryRequire(cand);
+      if (mod) {
+        // attempt mounting at /api first (common)
+        try {
+          app.use('/api', mod);
+          console.log(`Mounted ${cand} at /api`);
+          mountedPublic = true;
+        } catch (e) {
+          console.warn(`Failed to mount ${cand} at /api:`, e && e.message ? e.message : e);
+        }
+        // also try mounting at root / (so GET /products works if router defines /products)
+        try {
+          app.use('/', mod);
+          console.log(`Mounted ${cand} at / (root)`);
+          mountedPublic = true;
+        } catch (e) {
+          // ignore
+        }
+        break;
+      }
+    } catch (e) {
+      // just continue trying candidates
+    }
+  }
+
+  if (!mountedPublic) {
+    console.log('[app.cjs] No public products router found among candidates (publicProducts/productRoutes/products).');
   }
 
   // local admin upload endpoint if not using S3
@@ -263,22 +320,16 @@ async function tryRequire(p) {
     });
   });
 
-  // attempt explicit mount of adminProduct (if exists)
-  try {
-    const candidatePath = './src/routes/adminProduct.cjs';
-    const adminProductModule = await tryRequire(candidatePath);
-    if (adminProductModule) {
-      app.use('/admin-api', adminProductModule);
-      console.log(`Mounted ${candidatePath} at /admin-api`);
-    } else {
-      console.log(`adminProduct.cjs not found at ${candidatePath} (skipped explicit mount)`);
-    }
-  } catch (e) {
-    console.warn('Failed to explicitly mount ./src/routes/adminProduct.cjs:', e && e.message ? e.message : e);
-  }
-
   // fallback /api 404
   app.use('/api', (req, res) => res.status(404).json({ error: 'API endpoint not found' }));
+  // fallback root 404
+  app.use((req, res) => {
+    if (req.accepts('html')) {
+      res.status(404).send(`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Error</title></head><body><pre>Cannot ${req.method} ${req.path}</pre></body></html>`);
+    } else {
+      res.status(404).json({ error: `Cannot ${req.method} ${req.path}` });
+    }
+  });
 
   // global error handler (with DEBUG CORS echo)
   app.use((err, req, res, next) => {
